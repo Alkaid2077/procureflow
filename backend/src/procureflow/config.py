@@ -1,7 +1,7 @@
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import AliasChoices, Field, model_validator
+from pydantic import AliasChoices, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -76,6 +76,12 @@ class Settings(BaseSettings):
     rfq_match_threshold: float = 0.80
     min_native_text_chars: int = 50
     ocr_enabled: bool = True
+    ocr_language: str = Field(default="eng", min_length=1)
+    scan_vision_base_url: str = ""
+    scan_vision_model: str = ""
+    scan_vision_api_key: SecretStr | None = None
+    scan_vision_timeout_seconds: float = Field(default=15.0, gt=0, le=60)
+    scan_vision_max_rows: int = Field(default=4, ge=0, le=20)
 
     # External APIs
     exchange_rate_api_url: str = "https://open.er-api.com/v6/latest"

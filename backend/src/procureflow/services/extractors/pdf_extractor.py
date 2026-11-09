@@ -5,6 +5,7 @@ from typing import Any
 import fitz  # PyMuPDF
 import pdfplumber
 
+from procureflow.config import get_settings
 from procureflow.services.extractors.base import (
     BaseExtractor,
     ExtractedQuotationData,
@@ -12,9 +13,11 @@ from procureflow.services.extractors.base import (
     RawQuotationField,
     SourceEvidence,
 )
+from procureflow.services.extractors.chinese_quote import extract_chinese_rows
 from procureflow.services.extractors.csv_extractor import clean_num, detect_currency
 from procureflow.services.extractors.llm_extractor import llm_extractor
 from procureflow.services.extractors.ocr_engine import ocr_engine
+from procureflow.services.extractors.scan_review import review_scanned_items
 
 
 class PDFExtractor(BaseExtractor):
@@ -44,6 +47,7 @@ class PDFExtractor(BaseExtractor):
 
         evidence_registry: dict[str, SourceEvidence] = {}
         tagged_chunks: list[dict[str, Any]] = []
+        ocr_rows: dict[int, list[dict[str, Any]]] = {}
         is_scanned_doc = False
         all_text = ""
 
@@ -56,6 +60,7 @@ class PDFExtractor(BaseExtractor):
                 is_scanned_doc = True
                 ocr_result = ocr_engine.perform_ocr_page(page, page_num)
                 page_text = ocr_result.get("text", "")
+                ocr_rows[page_num] = ocr_result.get("rows", [])
                 all_text += f"\n{page_text}"
 
                 rect = page.rect
@@ -75,6 +80,8 @@ class PDFExtractor(BaseExtractor):
                     text_snippet=page_text[:120].strip() if page_text else None,
                 )
                 evidence_registry[ev_id] = evidence
+                if not page_text.strip():
+                    continue
                 tagged_chunks.append(
                     {
                         "evidence_id": ev_id,
@@ -109,7 +116,24 @@ class PDFExtractor(BaseExtractor):
                             }
                         )
 
+        page_count = len(doc)
         doc.close()
+
+        if ocr_rows and len(ocr_rows) == page_count:
+            parsed_pages = [
+                extract_chinese_rows(rows, number, reference_currency)
+                for number, rows in ocr_rows.items()
+            ]
+            if all(parsed_pages):
+                items = [item for rows in parsed_pages for item in rows]
+                with fitz.open(file_path) as scan:
+                    review_scanned_items(scan, items, ocr_rows, get_settings())
+                return ExtractedQuotationData(
+                    extraction_model="ocr-assisted-pdf",
+                    overall_confidence=Decimal("0.60"),
+                    line_items=items,
+                    validation_warnings=["Scanned quotation requires buyer review against the source."],
+                )
 
         # Step 2: Try deterministic table extraction via pdfplumber
         deterministic_items: list[RawLineItem] = []
@@ -222,6 +246,12 @@ class PDFExtractor(BaseExtractor):
             )
 
         # Step 3: LLM-Assisted interpretation referencing authoritative evidence chunks
+        if not tagged_chunks:
+            return ExtractedQuotationData(
+                extraction_model="ocr-assisted-pdf" if is_scanned_doc else "llm-assisted-pdf",
+                overall_confidence=Decimal("0"),
+                validation_warnings=["No readable quotation text found. Check OCR language packs or review manually."],
+            )
         llm_result = llm_extractor.extract_from_tagged_chunks(tagged_chunks, reference_currency)
         fallback_warning = (
             "Unstructured PDF extraction requires manual review against the source document."
@@ -279,6 +309,10 @@ class PDFExtractor(BaseExtractor):
                     warnings=row_warnings,
                 )
             )
+
+        if ocr_rows and line_items:
+            with fitz.open(file_path) as scan:
+                review_scanned_items(scan, line_items, ocr_rows, get_settings())
 
         fields: list[RawQuotationField] = []
         if llm_result.payment_terms:

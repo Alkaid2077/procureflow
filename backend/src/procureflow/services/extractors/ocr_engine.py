@@ -1,6 +1,9 @@
+import csv
+import io
 import shutil
 import subprocess
 import tempfile
+from pathlib import Path
 from typing import Any
 
 import fitz  # PyMuPDF
@@ -12,113 +15,117 @@ logger = structlog.get_logger(__name__)
 settings = get_settings()
 
 
+def group_ocr_rows(words: list[tuple[float, float, float, float, str]]) -> list[dict]:
+    """Group OCR words into visual rows across table columns."""
+    rows: list[list[tuple[float, float, float, float, str]]] = []
+    for word in sorted(words, key=lambda entry: (entry[1] + entry[3]) / 2):
+        if rows:
+            first = rows[-1][0]
+            center_delta = abs((word[1] + word[3] - first[1] - first[3]) / 2)
+            if center_delta <= min(word[3] - word[1], first[3] - first[1]) * 0.45:
+                rows[-1].append(word)
+                continue
+        rows.append([word])
+    return [
+        {
+            "text": " ".join(word[4] for word in sorted(row, key=lambda word: word[0])),
+            "words": sorted(row, key=lambda word: word[0]),
+            "bbox": [
+                min(word[0] for word in row),
+                min(word[1] for word in row),
+                max(word[2] for word in row),
+                max(word[3] for word in row),
+            ],
+        }
+        for row in rows
+    ]
+
+
 class OCREngine:
-    """OCR processing engine for scanned/image-only PDF pages using PyMuPDF and Tesseract."""
+    """Read raster PDFs with PyMuPDF OCR or a Tesseract CLI fallback."""
 
     def __init__(self) -> None:
         self.tesseract_bin = shutil.which("tesseract")
 
     def should_run_ocr(self, page: fitz.Page, min_chars: int | None = None) -> bool:
-        """
-        Determines whether OCR is required.
-        Combines native character count heuristic with presence of raster images.
-        Avoids OCR when native text is abundant to preserve performance.
-        """
         if not settings.ocr_enabled:
             return False
 
         threshold = min_chars if min_chars is not None else settings.min_native_text_chars
-        native_text = page.get_text() or ""
-        clean_text = native_text.strip()
-
-        # If native text exceeds threshold, OCR is not needed
-        if len(clean_text) >= threshold:
-            return False
-
-        # If page has very little text, check if it contains images (likely scanned)
-        images = page.get_images()
-        if len(images) > 0 or len(clean_text) == 0:
-            return True
-
-        return False
+        native_text = (page.get_text() or "").strip()
+        return len(native_text) < threshold and (not native_text or bool(page.get_images()))
 
     def perform_ocr_page(self, page: fitz.Page, page_num: int) -> dict[str, Any]:
-        """
-        Perform OCR on a single PDF page.
-        Returns dict with:
-          - text: extracted string
-          - ocr_confidence: float (0.0 to 1.0)
-          - blocks: list of text blocks with bounding boxes
-        """
-        # 1. Try PyMuPDF built-in OCR if tessdata is available
+        language = settings.ocr_language
         try:
-            tp = page.get_textpage_ocr(flags=0, dpi=150, full=True)
-            ocr_text = tp.extractText()
-            if ocr_text and len(ocr_text.strip()) > 0:
+            textpage = page.get_textpage_ocr(flags=0, language=language, dpi=150, full=True)
+            text = textpage.extractText()
+            if text.strip():
+                rows = group_ocr_rows([tuple(word[:5]) for word in textpage.extractWORDS()])
                 return {
-                    "text": ocr_text,
+                    "text": text,
+                    "rows": rows,
                     "ocr_confidence": 0.90,
                     "page_num": page_num,
                     "method": "pymupdf_ocr",
                 }
-        except Exception as e:
-            logger.debug("PyMuPDF native OCR unavailable, falling back to CLI", error=str(e))
+        except Exception as error:
+            logger.debug(
+                "PyMuPDF OCR unavailable, trying Tesseract", error_type=type(error).__name__
+            )
 
-        # 2. Fall back to Tesseract CLI on rendered image
         if self.tesseract_bin:
             try:
-                pix = page.get_pixmap(dpi=150)
-                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as img_file:
-                    img_path = img_file.name
-                    pix.save(img_path)
+                pixmap = page.get_pixmap(dpi=150)
+                with tempfile.TemporaryDirectory() as directory:
+                    image_path = Path(directory) / "page.png"
+                    pixmap.save(image_path)
+                    result = subprocess.run(
+                        [self.tesseract_bin, str(image_path), "stdout", "-l", language, "tsv"],
+                        capture_output=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=30,
+                    )
+                if result.returncode == 0:
+                    words = []
+                    scale_x, scale_y = (
+                        page.rect.width / pixmap.width,
+                        page.rect.height / pixmap.height,
+                    )
+                    for entry in csv.DictReader(io.StringIO(result.stdout), delimiter="\t"):
+                        word = (entry.get("text") or "").strip()
+                        if not word:
+                            continue
+                        left, top, width, height = (
+                            int(entry[key]) for key in ("left", "top", "width", "height")
+                        )
+                        words.append(
+                            (
+                                left * scale_x,
+                                top * scale_y,
+                                (left + width) * scale_x,
+                                (top + height) * scale_y,
+                                word,
+                            )
+                        )
+                    rows = group_ocr_rows(words)
+                    if rows:
+                        return {
+                            "text": "\n".join(row["text"] for row in rows),
+                            "rows": rows,
+                            "ocr_confidence": 0.88,
+                            "page_num": page_num,
+                            "method": "tesseract_cli",
+                        }
+            except (OSError, ValueError, KeyError, subprocess.TimeoutExpired) as error:
+                logger.warning("Tesseract OCR failed", error_type=type(error).__name__)
 
-                with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as out_base:
-                    out_base_path = out_base.name
-
-                cmd = [self.tesseract_bin, img_path, out_base_path.replace(".txt", ""), "-l", "eng"]
-                res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-
-                result_text = ""
-                final_out = (
-                    out_base_path if out_base_path.endswith(".txt") else f"{out_base_path}.txt"
-                )
-                try:
-                    with open(final_out, encoding="utf-8", errors="replace") as f:
-                        result_text = f.read()
-                except Exception:
-                    pass
-
-                # Cleanup temp files
-                try:
-                    import os
-
-                    if os.path.exists(img_path):
-                        os.remove(img_path)
-                    if os.path.exists(final_out):
-                        os.remove(final_out)
-                except Exception:
-                    pass
-
-                if res.returncode == 0 and result_text:
-                    return {
-                        "text": result_text,
-                        "ocr_confidence": 0.88,
-                        "page_num": page_num,
-                        "method": "tesseract_cli",
-                    }
-            except Exception as e:
-                logger.warning("Tesseract CLI OCR failed", error=str(e), page=page_num)
-
-        # Fallback to whatever native text exists
-        fallback_text = page.get_text() or ""
-        if not fallback_text.strip() and (
-            settings.environment == "test" or settings.llm_provider == "mock"
-        ):
-            fallback_text = "Heavy Duty Hydraulic Cylinder 50mm bore - Qty: 4 - Price: $320.00 - Total: $1280.00"
-
+        text = page.get_text() or ""
         return {
-            "text": fallback_text,
-            "ocr_confidence": 0.85 if not page.get_text() else 0.50,
+            "text": text,
+            "rows": [],
+            "ocr_confidence": 0.50 if text.strip() else 0.0,
             "page_num": page_num,
             "method": "native_fallback",
         }

@@ -569,6 +569,9 @@ export const ReviewWorkspacePage: React.FC = () => {
                   item.calculated_total_price ?? (Number(item.quantity) * Number(item.unit_price))
                 );
                 const hasMismatch = item.has_discrepancy;
+                const scanReview = item.human_corrected || item.is_removed
+                  ? undefined
+                  : (item.source_evidence?.scan_review as import("../api/quotation").ScanReview | undefined);
 
                 return (
                   <div
@@ -606,6 +609,26 @@ export const ReviewWorkspacePage: React.FC = () => {
                           )}
                         </div>
 
+                        {scanReview && (
+                          <div className="rounded border border-amber-800 bg-amber-950/30 p-2 text-amber-100">
+                            <div className="font-medium">Scan verification · {scanReview.reason.replace(/_/g, " ")}</div>
+                            {scanReview.outcome === "suggestion" && scanReview.field ? (
+                              <>
+                                <p>{scanReview.field.replace(/_/g, " ")}: {scanReview.original} → {scanReview.suggested}</p>
+                                <button type="button" className="mt-1 underline" onClick={(event) => {
+                                  event.stopPropagation();
+                                  if (scanReview.field && scanReview.suggested) {
+                                    handleSelectLineItem(item);
+                                    setEditingItem({ ...item, [scanReview.field]: Number(scanReview.suggested) });
+                                  }
+                                }}>Review suggested edit</button>
+                              </>
+                            ) : (
+                              <p>{scanReview.outcome === "unavailable" ? "Vision service unavailable. " : scanReview.outcome === "conflict" ? "Visual reading could not confirm a single change. " : ""}Manual verification required.</p>
+                            )}
+                          </div>
+                        )}
+
                         {/* RFQ Match Info */}
                         {rfq && (
                           <div className="text-[11px] text-slate-400">
@@ -637,8 +660,8 @@ export const ReviewWorkspacePage: React.FC = () => {
                           >
                             <Eye className="w-3 h-3" />
                             <span>
-                              {item.source_evidence.page_number
-                                ? `p. ${item.source_evidence.page_number}`
+                              {(item.source_evidence.page ?? item.source_evidence.page_number)
+                                ? `p. ${item.source_evidence.page ?? item.source_evidence.page_number}`
                                 : item.source_evidence.cell_range || t("review.evidence", "Evidence")}
                             </span>
                           </button>

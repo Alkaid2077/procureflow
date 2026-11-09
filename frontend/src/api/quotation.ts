@@ -30,6 +30,14 @@ export interface SupplierQuotation {
   documents: QuotationDocument[];
 }
 
+export interface ScanReview {
+  reason: "missing_or_invalid_amount" | "amount_mismatch" | "row_not_located" | "amount_not_in_row";
+  outcome: "manual" | "suggestion" | "conflict" | "unavailable";
+  field?: "quantity" | "unit_price" | "total_price";
+  original?: string;
+  suggested?: string;
+}
+
 export interface ExtractedLineItem {
   id: string;
   extracted_quotation_id: string;
